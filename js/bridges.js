@@ -3,8 +3,9 @@ import { distance, bearing, axisDiff, densify, simplify, makeProjector } from '.
 
 export const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
 ];
 
 const MOTOR_HIGHWAYS = new Set([
@@ -16,21 +17,66 @@ const DEAD = /^(proposed|construction|abandoned|razed|disused|planned|demolished
 
 const BRIDGE_FILTER = '["bridge"]["bridge"!="no"]';
 
-async function overpass(query, signal) {
+let preferred = 0; // zuletzt erfolgreicher Server
+
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => { clearTimeout(t); reject(abortError()); }, { once: true });
+});
+function abortError() {
+  const e = new Error('Abgebrochen');
+  e.name = 'AbortError';
+  return e;
+}
+
+/** Eine Abfrage an einen Server, mit eigenem Zeitlimit */
+async function overpassOnce(url, query, signal, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const onAbort = () => ctrl.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      body: 'data=' + encodeURIComponent(query),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`Overpass-Server antwortet mit ${res.status}`);
+    const json = await res.json();
+    // Bei Zeitüberschreitung o. Ä. liefert Overpass Status 200 mit leerer Liste und "remark"
+    if (json.remark && /error|timed out|out of memory|abort/i.test(json.remark)) {
+      throw new Error('Overpass: ' + json.remark);
+    }
+    if (!Array.isArray(json.elements)) throw new Error('Ungültige Overpass-Antwort');
+    return json;
+  } catch (e) {
+    if (signal?.aborted) throw abortError();
+    if (e.name === 'AbortError') throw new Error('Overpass-Zeitüberschreitung');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/**
+ * Abfrage mit Wiederholung: wechselt bei Fehlern den Server und wartet
+ * zunehmend länger (öffentliche Server sind oft überlastet).
+ */
+export async function overpass(query, signal, { attempts = 6, timeoutMs = 60000 } = {}) {
   let lastErr;
-  for (const url of OVERPASS_ENDPOINTS) {
+  for (let a = 0; a < attempts; a++) {
+    const idx = (preferred + a) % OVERPASS_ENDPOINTS.length;
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        body: 'data=' + encodeURIComponent(query),
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal,
-      });
-      if (!res.ok) throw new Error(`Overpass ${res.status}`);
-      return await res.json();
+      const json = await overpassOnce(OVERPASS_ENDPOINTS[idx], query, signal, timeoutMs);
+      preferred = idx;
+      return json;
     } catch (e) {
       if (e.name === 'AbortError') throw e;
       lastErr = e;
+      console.warn(OVERPASS_ENDPOINTS[idx], e.message);
+      if (a < attempts - 1 && a >= OVERPASS_ENDPOINTS.length - 1) await sleep(Math.min(2000 * 2 ** (a - OVERPASS_ENDPOINTS.length + 1), 15000), signal);
     }
   }
   throw lastErr || new Error('Overpass nicht erreichbar');
@@ -100,21 +146,55 @@ export async function fetchBridgesBBox(s, w, n, e, signal) {
   return parseBridges(await overpass(q, signal));
 }
 
-/** Alle Brücken entlang einer Linie (Route) – in Abschnitten abgefragt */
-export async function fetchBridgesAlongLine(points, radius = 30, signal, onProgress) {
+/**
+ * Route in Abschnitte für die Overpass-Abfrage teilen
+ * (je höchstens ~25 km bzw. 250 Stützpunkte).
+ */
+export function routeChunks(points, maxLen = 25000, maxPts = 250) {
   const simple = simplify(points, 10);
-  const CHUNK = 120;
-  const all = new Map();
   const chunks = [];
-  for (let i = 0; i < simple.length - 1; i += CHUNK - 1) chunks.push(simple.slice(i, i + CHUNK));
-  for (let k = 0; k < chunks.length; k++) {
-    const coords = chunks[k].map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`).join(',');
-    const q = `[out:json][timeout:60];(way${BRIDGE_FILTER}["highway"](around:${radius},${coords});way${BRIDGE_FILTER}["railway"](around:${radius},${coords}););out tags geom;`;
-    const res = parseBridges(await overpass(q, signal));
-    for (const [id, b] of res) all.set(id, b);
-    onProgress?.(k + 1, chunks.length);
+  let cur = [simple[0]], len = 0;
+  for (let i = 1; i < simple.length; i++) {
+    cur.push(simple[i]);
+    len += distance(simple[i - 1], simple[i]);
+    if ((len >= maxLen || cur.length >= maxPts) && i < simple.length - 1) {
+      chunks.push(cur);
+      cur = [simple[i]];
+      len = 0;
+    }
   }
-  return all;
+  if (cur.length > 1) chunks.push(cur);
+  return chunks;
+}
+
+/** Brücken entlang eines Routenabschnitts */
+export async function fetchBridgesAlongChunk(chunk, radius = 30, signal, opts = {}) {
+  const coords = chunk.map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`).join(',');
+  const q = `[out:json][timeout:90];(way${BRIDGE_FILTER}["highway"](around:${radius},${coords});way${BRIDGE_FILTER}["railway"](around:${radius},${coords}););out tags geom;`;
+  return parseBridges(await overpass(q, signal, { timeoutMs: 100000, ...opts }));
+}
+
+/**
+ * Alle Brücken entlang einer Route laden. Schlägt ein Abschnitt fehl, wird
+ * mit den übrigen weitergemacht; die fehlgeschlagenen werden zurückgegeben,
+ * damit sie später erneut versucht werden können.
+ * onChunk(neueBrücken, fertig, gesamt) wird nach jedem Abschnitt aufgerufen.
+ */
+export async function fetchBridgesAlongLine(chunks, radius = 30, signal, onChunk) {
+  const all = new Map();
+  const failed = [];
+  for (let k = 0; k < chunks.length; k++) {
+    try {
+      const res = await fetchBridgesAlongChunk(chunks[k], radius, signal);
+      for (const [id, b] of res) all.set(id, b);
+      onChunk?.(res, k + 1, chunks.length, failed.length);
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      failed.push(k);
+      onChunk?.(new Map(), k + 1, chunks.length, failed.length);
+    }
+  }
+  return { bridges: all, failed };
 }
 
 /**
@@ -195,8 +275,12 @@ export function matchBridgesToRoute(bridges, route, maxDist = 12) {
   // Zusammenfassen
   const merged = [];
   for (const h of hits) {
-    const prev = merged[merged.length - 1];
-    if (prev && prev.type === h.type && h.along <= prev.alongEnd + 40) {
+    // letzte Gruppe gleichen Typs suchen (Überfahrt/Unterführung können sich abwechseln)
+    let prev = null;
+    for (let i = merged.length - 1; i >= 0 && merged[i].alongEnd >= h.along - 200; i--) {
+      if (merged[i].type === h.type) { prev = merged[i]; break; }
+    }
+    if (prev && h.along <= prev.alongEnd + 40) {
       prev.bridges.push(h.bridge);
       prev.alongEnd = Math.max(prev.alongEnd, h.alongEnd);
       if (!prev.named && h.named) { prev.name = h.name; prev.named = true; }

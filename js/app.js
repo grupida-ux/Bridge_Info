@@ -1,6 +1,6 @@
 // Brücken-Info – Hauptlogik
 import { distance, bearing, destination, Polyline } from './geo.js';
-import { fetchBridgesBBox, fetchBridgesAlongLine, bridgesAhead, matchBridgesToRoute } from './bridges.js';
+import { fetchBridgesBBox, fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute } from './bridges.js';
 import { geocode, route as calcRoute } from './route.js';
 import { unlockAudio, beep, speak, vibrate } from './alerts.js';
 
@@ -151,6 +151,7 @@ function onPosition(p) {
     if (m && m.dist < 60) {
       mode = 'route';
       state.routeHint = m.index;
+      state.routeAlong = m.along;
       state.offRouteCount = 0;
       if (state.heading == null || state.speed < 1.5) state.heading = state.route.bearingAt(m.index);
       upcoming = state.routeBridges
@@ -287,7 +288,9 @@ function renderNext(upcoming, mode) {
     box.className = 'next empty';
     box.innerHTML = state.heading == null
       ? '<div class="next-title">Warte auf Fahrtrichtung …</div><div class="next-sub">Losfahren oder Route planen</div>'
-      : `<div class="next-title">Keine Brücke voraus</div><div class="next-sub">${mode === 'route' ? 'auf der restlichen Route' : 'in Fahrtrichtung'}</div>`;
+      : routeDataMissing(mode)
+        ? '<div class="next-title">Brückendaten werden noch geladen</div><div class="next-sub">Für den vor Ihnen liegenden Abschnitt fehlen noch Daten – bitte auf Schilder achten</div>'
+        : `<div class="next-title">Keine Brücke voraus</div><div class="next-sub">${mode === 'route' ? 'auf der restlichen Route' : 'in Fahrtrichtung'}</div>`;
     highlight(null);
     return;
   }
@@ -302,6 +305,13 @@ function renderNext(upcoming, mode) {
       ${warn ? `<div class="next-warn">⚠ ${esc(warn)}</div>` : ''}
     </div>`;
   highlight(item);
+}
+
+/** Fehlen für die nächsten Kilometer der Route noch Daten? */
+function routeDataMissing(mode) {
+  if (mode !== 'route' || !state.routeChunks) return false;
+  const a = state.routeAlong ?? 0;
+  return state.routeChunks.some((c) => !c.done && c.to >= a && c.from <= a + 3000);
 }
 
 function highlight(item) {
@@ -471,24 +481,88 @@ async function planRoute(dest, silent = false) {
     $('route-remaining').textContent = '';
     $('route-count').textContent = 'lade …';
 
-    setInfo('Suche Brücken entlang der Route …');
-    const bridges = await fetchBridgesAlongLine(r.points, 30, ctrl.signal, (k, n) => {
-      if (n > 1) setInfo(`Suche Brücken entlang der Route … ${Math.round((k / n) * 100)} %`);
-    });
-    if (ctrl.signal.aborted) return;
-    state.routeBridges = matchBridgesToRoute(bridges, poly);
     state.fired = new Set([...state.fired].filter((k) => !k.startsWith('r')));
-    drawRouteBridges();
-    const nConf = state.routeBridges.filter(conflict).length;
-    setInfo(`${state.routeBridges.length} Brücken auf der Route${nConf ? ` – ${nConf} mit Einschränkung für Ihr Fahrzeug!` : ''}`);
-    renderRouteList([], 'none');
-    if (state.pos) onPosition({ ...state.pos, accuracy: null, speed: state.speed, heading: state.heading });
+    await loadRouteBridges(poly, ctrl);
   } catch (e) {
     if (e.name === 'AbortError') return;
     setInfo(e.message || 'Fehler bei der Routenberechnung');
     console.warn(e);
   }
 }
+
+/* Bereits geladene Routenabschnitte (für Neuberechnungen wiederverwenden) */
+const bridgeCache = new Map();
+const loadedLines = [];
+
+function isCovered(pts) {
+  return pts.every((p) => loadedLines.some((l) => { const m = l.locateNear(p); return m && m.dist < 20; }));
+}
+
+const wait = (ms, signal) => new Promise((resolve, reject) => {
+  const t = setTimeout(resolve, ms);
+  signal.addEventListener('abort', () => { clearTimeout(t); reject(Object.assign(new Error('abort'), { name: 'AbortError' })); }, { once: true });
+});
+
+/**
+ * Brücken abschnittsweise laden. Jeder fertige Abschnitt erscheint sofort;
+ * fehlgeschlagene Abschnitte (Server überlastet) werden mit wachsendem
+ * Abstand automatisch erneut abgefragt.
+ */
+async function loadRouteBridges(poly, ctrl) {
+  const chunks = routeChunks(poly.pts).map((pts) => {
+    const a = poly.locateNear(pts[0]), b = poly.locateNear(pts[pts.length - 1]);
+    return { pts, from: a ? a.along : 0, to: b ? b.along : poly.length, done: isCovered(pts) };
+  });
+  state.routeChunks = chunks;
+  const n = chunks.length;
+  const refresh = () => {
+    if (state.route !== poly) return;
+    // auch die Brücken aus der Umgebungssuche (freie Fahrt) mitverwenden
+    state.routeBridges = matchBridgesToRoute(new Map([...state.bridges, ...bridgeCache]), poly);
+    drawRouteBridges();
+    renderRouteList([], 'none');
+    if (state.pos && state.tracking) onPosition({ ...state.pos, accuracy: null, speed: state.speed, heading: state.heading });
+  };
+  const report = (extra = '') => {
+    const open = chunks.filter((c) => !c.done).length;
+    const nConf = state.routeBridges.filter(conflict).length;
+    const base = `${state.routeBridges.length} Brücken auf der Route${nConf ? ` – ${nConf} mit Einschränkung für Ihr Fahrzeug!` : ''}`;
+    setInfo(open ? `${base} · ${n - open} von ${n} Abschnitten geladen${extra}` : base);
+    $('route-missing').hidden = !open;
+    if (open) {
+      const first = chunks.find((c) => !c.done);
+      $('route-missing').textContent = `⚠ Brückendaten ab km ${Math.floor(first.from / 1000)} noch unvollständig (${open} von ${n} Abschnitten fehlen)`;
+    }
+  };
+  refresh();
+  report();
+  const DELAYS = [0, 10, 30, 60, 120, 180, 300, 300, 300, 300];
+  for (let round = 0; round < DELAYS.length; round++) {
+    const todo = chunks.filter((c) => !c.done);
+    if (!todo.length) break;
+    if (DELAYS[round]) {
+      report(` – Server überlastet, neuer Versuch in ${DELAYS[round]} s`);
+      await wait(DELAYS[round] * 1000, ctrl.signal);
+    }
+    for (const c of todo) {
+      try {
+        report(' …');
+        const res = await fetchBridgesAlongChunk(c.pts, 30, ctrl.signal, { attempts: 4 });
+        for (const [id, b] of res) bridgeCache.set(id, b);
+        c.done = true;
+        loadedLines.push(new Polyline(c.pts));
+        refresh();
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+      }
+    }
+  }
+  report(chunks.some((c) => !c.done) ? ' – bitte später „Neu laden“ tippen' : '');
+}
+
+$('btn-reload').addEventListener('click', () => {
+  if (state.dest) planRoute(state.dest, true);
+});
 
 function drawRouteBridges() {
   routeBridgeLayer.clearLayers();
@@ -511,6 +585,7 @@ function clearRoute() {
   if (destMarker) map.removeLayer(destMarker);
   destMarker = null;
   $('route-panel').hidden = true;
+  $('route-missing').hidden = true;
   $('dest-input').value = '';
   setInfo('Route gelöscht – freie Fahrt');
 }

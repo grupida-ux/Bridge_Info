@@ -83,6 +83,8 @@ button.small { background: color-mix(in srgb, var(--muted) 16%, transparent); pa
 #route-panel { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
 .route-head { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
 .route-actions { display: flex; gap: 6px; flex: none; }
+.route-missing { margin-top: 8px; padding: 8px 10px; border-radius: 10px; font-size: 13px;
+  background: color-mix(in srgb, var(--near) 20%, transparent); }
 .route-list { list-style: none; margin: 8px 0 0; padding: 0; }
 @media (max-width: 759px) { .route-list { max-height: 26vh; overflow-y: auto; } }
 .route-list li { display: flex; gap: 10px; align-items: baseline; padding: 7px 2px; border-top: 1px solid var(--line); cursor: pointer; }
