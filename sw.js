@@ -1,6 +1,6 @@
 // Einfacher Service Worker: App-Dateien offline verfügbar (Daten kommen immer live)
-const CACHE = 'bridgeinfo-v1';
-const SHELL = ['./', 'index.html', 'css/style.css', 'js/app.js', 'js/geo.js', 'js/bridges.js', 'js/route.js', 'js/alerts.js', 'icon.svg', 'manifest.webmanifest'];
+const CACHE = 'bridgeinfo-v2';
+const SHELL = ['./', 'index.html', 'css/style.css', 'js/app.js', 'js/geo.js', 'js/bridges.js', 'js/route.js', 'js/alerts.js', 'js/roads.js', 'icon.svg', 'manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
