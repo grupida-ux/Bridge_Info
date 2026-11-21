@@ -130,6 +130,7 @@ export function parseBridges(json) {
       dense: densify(geom, 8),
       maxheight: parseMeters(tags.maxheight || tags['maxheight:physical']),
       maxweight: parseTons(tags.maxweight),
+      height: parseMeters(tags['bridge:height'] || tags.height),
       length: geom.slice(1).reduce((s, p, i) => s + distance(geom[i], p), 0),
     };
     b.name = bridgeName(b);
@@ -269,6 +270,8 @@ export function matchBridgesToRoute(bridges, route, maxDist = 12) {
       point: first.m.point,
       maxheight: b.maxheight,
       maxweight: b.maxweight,
+      height: b.height,
+      wayLength: b.groupLength ?? b.length,
     });
   }
   hits.sort((a, b) => a.along - b.along);
@@ -286,10 +289,57 @@ export function matchBridgesToRoute(bridges, route, maxDist = 12) {
       if (!prev.named && h.named) { prev.name = h.name; prev.named = true; }
       prev.maxheight = minDefined(prev.maxheight, h.maxheight);
       prev.maxweight = minDefined(prev.maxweight, h.maxweight);
+      prev.height = maxDefined(prev.height, h.height);
+      prev.wayLength = Math.max(prev.wayLength, h.wayLength);
     } else merged.push(h);
   }
-  merged.forEach((h, i) => (h.key = 'r' + i + ':' + h.bridge.id));
+  merged.forEach((h, i) => {
+    h.key = 'r' + i + ':' + h.bridge.id;
+    // Länge: bei Überfahrt die auf der Route zurückgelegte Strecke,
+    // mindestens aber die Länge des zusammenhängenden Brückenzugs
+    h.length = h.type === 'over' ? Math.max(h.alongEnd - h.along, h.wayLength) : h.wayLength;
+  });
   return merged;
+}
+
+function maxDefined(a, b) {
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.max(a, b);
+}
+
+/**
+ * Brücken sind in OSM oft in mehrere Wege geteilt. Wege, die an einem Ende
+ * aneinanderstoßen und in gleicher Richtung weiterlaufen, werden zu einem
+ * Brückenzug zusammengefasst; groupLength ist dessen Gesamtlänge.
+ */
+export function computeGroups(bridges) {
+  const parent = new Map();
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const ends = new Map();
+  const key = (p) => p.lat.toFixed(7) + ',' + p.lon.toFixed(7);
+  for (const b of bridges.values()) {
+    parent.set(b.id, b.id);
+    const g = b.geom;
+    for (const [p, q] of [[g[0], g[1]], [g[g.length - 1], g[g.length - 2]]]) {
+      const k = key(p);
+      let arr = ends.get(k);
+      if (!arr) ends.set(k, (arr = []));
+      arr.push({ b, dir: bearing(p, q) });
+    }
+  }
+  for (const arr of ends.values()) {
+    for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) {
+      const A = arr[i], B = arr[j];
+      if (A.b.kind !== B.b.kind) continue;
+      // gerade Fortsetzung: Richtungen vom gemeinsamen Punkt weg sind entgegengesetzt
+      if (axisDiff(A.dir, B.dir) > 30) continue;
+      parent.set(find(A.b.id), find(B.b.id));
+    }
+  }
+  const sums = new Map();
+  for (const b of bridges.values()) { const r = find(b.id); sums.set(r, (sums.get(r) || 0) + b.length); }
+  for (const b of bridges.values()) b.groupLength = sums.get(find(b.id));
 }
 
 function minDefined(a, b) {
