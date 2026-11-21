@@ -1,7 +1,8 @@
 // Brücken-Info – Hauptlogik
 import { distance, bearing, destination, Polyline } from './geo.js';
-import { fetchBridgesBBox, fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute, computeGroups } from './bridges.js';
+import { fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute, computeGroups } from './bridges.js';
 import { geocode, route as calcRoute } from './route.js';
+import { fetchArea, predictBridges } from './roads.js';
 import { unlockAudio, beep, speak, vibrate } from './alerts.js';
 
 /* ---------------- Einstellungen ---------------- */
@@ -37,7 +38,8 @@ const state = {
   headingRef: null,
   // freie Fahrt
   bridges: new Map(),
-  loadCenter: null,
+  network: null,        // Straßennetz der Umgebung (Modus ohne Ziel)
+  matchWayId: null,     // zuletzt befahrene Straße
   loadingArea: false,
   lastLoadFail: 0,
   // Route
@@ -129,7 +131,7 @@ const fmtLen = (m) => (m >= 1000 ? `${nf1.format(m / 1000)} km` : `${Math.max(1,
 
 function details(item) {
   const d = [];
-  if (item.type !== 'under' && item.length > 0) d.push(`${fmtLen(item.length)} lang`);
+  if (item.type !== 'under' && item.length > 0) d.push(item.partial ? `noch ${fmtLen(item.length)}` : `${fmtLen(item.length)} lang`);
   if (item.height != null) d.push(`${nf1.format(item.height)} m hoch`);
   if (item.maxheight != null) d.push(`max. Höhe ${nf1.format(item.maxheight)} m`);
   if (item.maxweight != null) d.push(`max. ${nf1.format(item.maxweight)} t`);
@@ -160,7 +162,7 @@ function onPosition(p) {
   let upcoming = [];
   let mode = 'free';
 
-  if (state.route) {
+  if (state.route && !state.demoNoRoute) {
     const m = state.route.locate(pos, state.routeHint);
     if (m && m.dist < 60) {
       mode = 'route';
@@ -185,24 +187,40 @@ function onPosition(p) {
   }
 
   if (mode === 'free') {
-    ensureAreaBridges(pos);
-    if (state.heading != null) {
-      const look = Math.min(2500, Math.max(600, state.speed * 45, settings.alertDistance * 1.6));
-      upcoming = bridgesAhead(state.bridges, pos, state.heading, look).map((c) => ({
-        key: 'f' + c.bridge.id,
-        bridge: c.bridge,
-        name: c.bridge.name,
-        type: c.type,
-        distance: c.distance,
-        point: c.point,
-        onIt: c.onIt,
-        maxheight: c.bridge.maxheight,
-        maxweight: c.bridge.maxweight,
-        length: c.bridge.groupLength ?? c.bridge.length,
-        height: c.bridge.height,
-      })).filter(visible);
+    const look = Math.min(2500, Math.max(800, state.speed * 45, settings.alertDistance * 1.6));
+    ensureAreaData(pos, state.heading, look);
+    let pred = null;
+    if (state.heading != null && state.network?.contains(pos, 50)) {
+      const withUnder = settings.showUnder || settings.vehicleHeight > 0;
+      pred = predictBridges(state.network, state.bridges, pos, state.heading, look, state.matchWayId, withUnder);
     }
-  }
+    if (pred) {
+      // Straße erkannt: ihrem Verlauf vorausfolgen
+      mode = 'follow';
+      state.matchWayId = pred.wayId;
+      upcoming = pred.items.filter(visible);
+      drawPrediction(pred.points);
+    } else {
+      // keine Straße zugeordnet (Daten fehlen, Parkplatz …): geradeaus schauen
+      state.matchWayId = null;
+      drawPrediction(null);
+      if (state.heading != null) {
+        upcoming = bridgesAhead(state.bridges, pos, state.heading, look).map((c) => ({
+          key: 'f' + c.bridge.id,
+          bridge: c.bridge,
+          name: c.bridge.name,
+          type: c.type,
+          distance: c.distance,
+          point: c.point,
+          onIt: c.onIt,
+          maxheight: c.bridge.maxheight,
+          maxweight: c.bridge.maxweight,
+          length: c.bridge.groupLength ?? c.bridge.length,
+          height: c.bridge.height,
+        })).filter(visible);
+      }
+    }
+  } else drawPrediction(null);
 
   state.mode = mode;
   renderNext(upcoming, mode);
@@ -249,34 +267,48 @@ function updateStatus(acc) {
   $('status').textContent = parts.join(' · ');
 }
 
-/* ---------------- Brücken im Umkreis laden (freie Fahrt) ---------------- */
-async function ensureAreaBridges(pos) {
+/* ---------------- Straßen + Brücken der Umgebung laden (ohne Ziel) ---------------- */
+async function ensureAreaData(pos, heading, look) {
   if (state.loadingArea) return;
-  if (state.loadCenter && distance(state.loadCenter, pos) < 1500) return;
+  const net = state.network;
+  const ahead = heading != null ? destination(pos, heading, look + 300) : pos;
+  if (net && net.contains(pos, 400) && net.contains(ahead)) return;
   if (Date.now() - state.lastLoadFail < 20000) return;
   state.loadingArea = true;
-  setInfo('Lade Brücken in der Umgebung …');
-  const r = 3500;
-  const n = destination(pos, 0, r).lat, s = destination(pos, 180, r).lat;
-  const e = destination(pos, 90, r).lon, w = destination(pos, 270, r).lon;
+  setInfo('Lade Straßen und Brücken in Fahrtrichtung …');
+  // Ausschnitt in Fahrtrichtung vorverlegt, damit seltener nachgeladen werden muss
+  const R = Math.min(5000, Math.max(2000, look * 2));
+  const c = heading != null ? destination(pos, heading, R * 0.5) : pos;
+  const bbox = {
+    n: destination(c, 0, R).lat, s: destination(c, 180, R).lat,
+    e: destination(c, 90, R).lon, w: destination(c, 270, R).lon,
+  };
   try {
-    const found = await fetchBridgesBBox(s, w, n, e);
-    for (const [id, b] of found) state.bridges.set(id, b);
-    computeGroups(state.bridges);
-    // Speicher begrenzen
-    if (state.bridges.size > 4000) {
-      for (const [id, b] of state.bridges) if (distance(b.geom[0], pos) > 10000) state.bridges.delete(id);
+    const { network, bridges } = await fetchArea(bbox);
+    state.network = network;
+    for (const [id, b] of bridges) state.bridges.set(id, b);
+    if (state.bridges.size > 6000) {
+      for (const [id, b] of state.bridges) if (distance(b.geom[0], pos) > 12000) state.bridges.delete(id);
     }
-    state.loadCenter = pos;
+    computeGroups(state.bridges);
     drawAreaBridges();
-    setInfo(`${found.size} Brückenabschnitte im Umkreis geladen`);
+    setInfo(`${network.ways.length} Straßenabschnitte und ${bridges.size} Brücken in Fahrtrichtung geladen`);
   } catch (e) {
     state.lastLoadFail = Date.now();
-    setInfo('Brückendaten konnten nicht geladen werden – neuer Versuch in Kürze');
+    setInfo('Straßendaten konnten nicht geladen werden – neuer Versuch in Kürze');
     console.warn(e);
   } finally {
     state.loadingArea = false;
   }
+}
+
+/* Vorhergesagter Weg (gestrichelt) */
+let predictionLine = null;
+function drawPrediction(points) {
+  if (!points) { if (predictionLine) { map.removeLayer(predictionLine); predictionLine = null; } return; }
+  const ll = points.map((p) => [p.lat, p.lon]);
+  if (predictionLine) predictionLine.setLatLngs(ll);
+  else predictionLine = L.polyline(ll, { className: 'predict-line', weight: 6, interactive: false }).addTo(map);
 }
 
 function drawAreaBridges() {
@@ -300,7 +332,9 @@ function popupHtml(item, b) {
 function renderNext(upcoming, mode) {
   const box = $('next');
   const item = upcoming.find((u) => !u.onIt) || upcoming[0];
-  $('mode').textContent = mode === 'route' ? 'Route' : state.route ? 'Abseits der Route' : 'Freie Fahrt';
+  $('mode').textContent = mode === 'route' ? 'Route'
+    : state.route && !state.demoNoRoute ? 'Abseits der Route'
+    : mode === 'follow' ? 'Straße folgen' : 'Geradeaus';
   if (!state.tracking) return;
   if (!item) {
     box.className = 'next empty';
@@ -308,7 +342,7 @@ function renderNext(upcoming, mode) {
       ? '<div class="next-title">Warte auf Fahrtrichtung …</div><div class="next-sub">Losfahren oder Route planen</div>'
       : routeDataMissing(mode)
         ? '<div class="next-title">Brückendaten werden noch geladen</div><div class="next-sub">Für den vor Ihnen liegenden Abschnitt fehlen noch Daten – bitte auf Schilder achten</div>'
-        : `<div class="next-title">Keine Brücke voraus</div><div class="next-sub">${mode === 'route' ? 'auf der restlichen Route' : 'in Fahrtrichtung'}</div>`;
+        : `<div class="next-title">Keine Brücke voraus</div><div class="next-sub">${mode === 'route' ? 'auf der restlichen Route' : mode === 'follow' ? 'im weiteren Straßenverlauf' : 'in Fahrtrichtung'}</div>`;
     highlight(null);
     return;
   }
@@ -372,6 +406,8 @@ function checkAlerts(upcoming, mode) {
     const threshold = warn ? Math.max(settings.alertDistance, 1500) : settings.alertDistance;
     if (item.distance > threshold) continue;
     if (state.fired.has(item.key)) continue;
+    // Bereits auf der Brücke (z. B. lange Hochstraße aus vielen Teilstücken): keine neue Ansage
+    if (item.onIt && mode === 'follow') { state.fired.add(item.key); continue; }
     // Doppelte Meldungen (z. B. zweite Richtungsfahrbahn) vermeiden
     if (state.firedPoints.some((f) => f.type === item.type && distance(f.p, item.point) < 120)) {
       state.fired.add(item.key);
@@ -617,7 +653,7 @@ function clearRoute() {
 }
 
 /* ---------------- Demo / Simulation ---------------- */
-function startDemo() {
+function startDemo(noRoute = false) {
   if (!state.route) { toast('Für die Demo zuerst ein Ziel suchen (oder lange auf die Karte tippen)'); return; }
   unlockAudio();
   if (state.watchId != null) navigator.geolocation.clearWatch(state.watchId);
@@ -625,6 +661,8 @@ function startDemo() {
   stopDemo();
   state.tracking = true;
   state.demoAlong = 0;
+  state.demoNoRoute = noRoute;
+  state.matchWayId = null;
   state.routeHint = 0;
   state.fired.clear();
   state.firedPoints = [];
@@ -643,6 +681,7 @@ function startDemo() {
   map.setZoom(16);
 }
 function stopDemo() {
+  state.demoNoRoute = false;
   if (state.demoTimer) clearInterval(state.demoTimer);
   state.demoTimer = null;
 }
@@ -666,7 +705,8 @@ function log(t) {
 /* ---------------- UI-Verdrahtung ---------------- */
 $('btn-start').addEventListener('click', () => (state.tracking ? stop() : start()));
 $('btn-center').addEventListener('click', () => setFollow(true));
-$('btn-demo').addEventListener('click', startDemo);
+$('btn-demo').addEventListener('click', () => startDemo(false));
+$('btn-demo-free').addEventListener('click', () => startDemo(true));
 $('btn-clear-route').addEventListener('click', clearRoute);
 $('btn-toggle-list').addEventListener('click', () => {
   const l = $('route-list');
