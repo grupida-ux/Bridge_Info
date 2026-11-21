@@ -22,10 +22,9 @@ Tipp fürs Handy: Im Browser-Menü „Zum Startbildschirm hinzufügen“ wählen
 
 ## Veröffentlichen (GitHub Pages)
 
-Die App besteht nur aus statischen Dateien und braucht keinen Server-Code:
+Die App besteht nur aus statischen Dateien. Der Workflow `.github/workflows/pages.yml` veröffentlicht sie bei jedem Push auf `main` automatisch.
 
-1. Im Repository unter *Settings → Pages* als Quelle „Deploy from a branch“ wählen, Branch und Ordner `/ (root)` angeben.
-2. Nach kurzer Zeit ist die App unter `https://<benutzer>.github.io/<repo>/` erreichbar.
+Einmalig nötig: Im Repository unter *Settings → Pages* bei „Source“ **GitHub Actions** auswählen (falls der Workflow das nicht selbst erledigen konnte). Danach ist die App unter `https://grupida-ux.github.io/bridge_info/` erreichbar.
 
 Lokal testen: `python3 -m http.server 8000` und `http://localhost:8000` öffnen (localhost zählt als sicher, GPS funktioniert also).
 
