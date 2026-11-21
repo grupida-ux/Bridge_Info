@@ -1,6 +1,6 @@
 // Brücken-Info – Hauptlogik
 import { distance, bearing, destination, Polyline } from './geo.js';
-import { fetchBridgesBBox, fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute } from './bridges.js';
+import { fetchBridgesBBox, fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute, computeGroups } from './bridges.js';
 import { geocode, route as calcRoute } from './route.js';
 import { unlockAudio, beep, speak, vibrate } from './alerts.js';
 
@@ -12,6 +12,7 @@ const DEFAULTS = {
   speech: true,
   sound: true,
   vibration: true,
+  showUnder: false,     // Unterführungen (unter Brücken durch) anzeigen
   demoSpeed: 80,        // km/h
   demoFactor: 2,        // Zeitraffer
 };
@@ -101,7 +102,8 @@ function speechDist(m) {
     const r = m < 200 ? Math.round(m / 10) * 10 : Math.round(m / 50) * 50;
     if (r < 1000) return `${r} Metern`;
   }
-  return `${nf1.format(m / 1000)} Kilometern`;
+  const km = nf1.format(m / 1000);
+  return km === '1' ? '1 Kilometer' : `${km} Kilometern`;
 }
 const TYPE_LABEL = { over: 'Brücke (Überfahrt)', under: 'Unterführung' };
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -115,8 +117,20 @@ function conflict(item) {
   return null;
 }
 
+/**
+ * Unterführungen nur zeigen, wenn eingeschaltet – oder wenn sie für das
+ * eigene Fahrzeug zu niedrig sind (Sicherheitswarnung).
+ */
+function visible(item) {
+  return item.type !== 'under' || settings.showUnder || !!conflict(item);
+}
+
+const fmtLen = (m) => (m >= 1000 ? `${nf1.format(m / 1000)} km` : `${Math.max(1, Math.round(m))} m`);
+
 function details(item) {
   const d = [];
+  if (item.type !== 'under' && item.length > 0) d.push(`${fmtLen(item.length)} lang`);
+  if (item.height != null) d.push(`${nf1.format(item.height)} m hoch`);
   if (item.maxheight != null) d.push(`max. Höhe ${nf1.format(item.maxheight)} m`);
   if (item.maxweight != null) d.push(`max. ${nf1.format(item.maxweight)} t`);
   return d.join(' · ');
@@ -155,7 +169,7 @@ function onPosition(p) {
       state.offRouteCount = 0;
       if (state.heading == null || state.speed < 1.5) state.heading = state.route.bearingAt(m.index);
       upcoming = state.routeBridges
-        .filter((b) => b.alongEnd >= m.along - 5)
+        .filter((b) => b.alongEnd >= m.along - 5 && visible(b))
         .map((b) => ({ ...b, distance: b.along - m.along, onIt: b.along <= m.along }));
       const remaining = state.route.length - m.along;
       $('route-remaining').textContent = `Noch ${fmtDist(remaining)} bis zum Ziel`;
@@ -184,7 +198,9 @@ function onPosition(p) {
         onIt: c.onIt,
         maxheight: c.bridge.maxheight,
         maxweight: c.bridge.maxweight,
-      }));
+        length: c.bridge.groupLength ?? c.bridge.length,
+        height: c.bridge.height,
+      })).filter(visible);
     }
   }
 
@@ -246,6 +262,7 @@ async function ensureAreaBridges(pos) {
   try {
     const found = await fetchBridgesBBox(s, w, n, e);
     for (const [id, b] of found) state.bridges.set(id, b);
+    computeGroups(state.bridges);
     // Speicher begrenzen
     if (state.bridges.size > 4000) {
       for (const [id, b] of state.bridges) if (distance(b.geom[0], pos) > 10000) state.bridges.delete(id);
@@ -265,8 +282,9 @@ async function ensureAreaBridges(pos) {
 function drawAreaBridges() {
   areaLayer.clearLayers();
   for (const b of state.bridges.values()) {
+    if (b.kind !== 'road' && !settings.showUnder) continue;
     L.polyline(b.geom.map((p) => [p.lat, p.lon]), { className: `bridge-line kind-${b.kind}`, weight: 5 })
-      .bindPopup(popupHtml({ name: b.name, maxheight: b.maxheight, maxweight: b.maxweight }, b))
+      .bindPopup(popupHtml({ name: b.name, maxheight: b.maxheight, maxweight: b.maxweight, length: b.groupLength ?? b.length, height: b.height }, b))
       .addTo(areaLayer);
   }
 }
@@ -373,6 +391,10 @@ function fireAlert(item, warn) {
   if (item.name && !/^(Straßen|Eisenbahn|Fuß)/.test(item.name)) text += `, ${item.name}`;
   if (warn) text = `Achtung! ${text}. ${warn.replace(/ m\b/g, ' Meter').replace(/ t\b/g, ' Tonnen').replace(/!$/, '')}!`;
   else if (item.type === 'under' && item.maxheight != null) text += `. Durchfahrtshöhe ${nf1.format(item.maxheight)} Meter`;
+  if (!warn && item.type === 'over' && item.length >= 20) {
+    text += `, ${item.length >= 1000 ? `${nf1.format(item.length / 1000)} Kilometer` : `${Math.round(item.length / 10) * 10} Meter`} lang`;
+    if (item.height != null) text += `, ${nf1.format(item.height)} Meter hoch`;
+  }
 
   const banner = $('alert');
   banner.className = `alert show ${warn ? 'danger' : ''}`;
@@ -518,7 +540,10 @@ async function loadRouteBridges(poly, ctrl) {
   const refresh = () => {
     if (state.route !== poly) return;
     // auch die Brücken aus der Umgebungssuche (freie Fahrt) mitverwenden
-    state.routeBridges = matchBridgesToRoute(new Map([...state.bridges, ...bridgeCache]), poly);
+    const all = new Map([...state.bridges, ...bridgeCache]);
+    computeGroups(all);
+    state.routeBridgesAll = matchBridgesToRoute(all, poly);
+    state.routeBridges = state.routeBridgesAll.filter(visible);
     drawRouteBridges();
     renderRouteList([], 'none');
     if (state.pos && state.tracking) onPosition({ ...state.pos, accuracy: null, speed: state.speed, heading: state.heading });
@@ -579,6 +604,7 @@ function clearRoute() {
   state.abort?.abort();
   state.route = null;
   state.routeBridges = [];
+  state.routeBridgesAll = null;
   state.dest = null;
   routeLayer.clearLayers();
   routeBridgeLayer.clearLayers();
@@ -689,6 +715,8 @@ dlg.addEventListener('close', () => {
     settings[el.name] = el.type === 'checkbox' ? el.checked : Number(el.value) || 0;
   }
   save('bridgeinfo.settings', settings);
+  if (state.routeBridgesAll) state.routeBridges = state.routeBridgesAll.filter(visible);
+  drawAreaBridges();
   drawRouteBridges();
   renderRouteList([], 'none');
   if (state.pos && state.tracking) onPosition({ ...state.pos, accuracy: null, speed: state.speed, heading: state.heading });
@@ -696,7 +724,7 @@ dlg.addEventListener('close', () => {
 });
 $('btn-test').addEventListener('click', () => {
   unlockAudio();
-  fireAlert({ type: 'under', name: 'Testbrücke', distance: settings.alertDistance, maxheight: 4.2, point: { lat: 0, lon: 0 } }, null);
+  fireAlert({ type: 'over', name: 'Testbrücke', distance: settings.alertDistance, length: 350, height: 25, point: { lat: 0, lon: 0 } }, null);
 });
 
 // Service Worker (Offline-Start, „Zum Startbildschirm hinzufügen“)
