@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Brücken-Info</title>
+  <meta name="description" content="Warnt in Echtzeit vor Brücken und Unterführungen auf Ihrer Strecke.">
+  <meta name="theme-color" content="#0f172a">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="topbar">
+    <div class="chip"><span id="mode">Freie Fahrt</span> · <span id="status">GPS aus</span></div>
+    <button id="btn-settings" class="icon-btn" title="Einstellungen" aria-label="Einstellungen">⚙</button>
+  </div>
+
+  <div id="alert" class="alert" role="alert" aria-live="assertive"></div>
+  <div id="toast" class="toast" role="status"></div>
+
+  <button id="btn-center" class="fab active" title="Auf Fahrzeug zentrieren" aria-label="Auf Fahrzeug zentrieren">◎</button>
+
+  <section id="sheet">
+    <div id="next" class="next empty">
+      <div class="next-title">Brücken-Info</div>
+      <div class="next-sub">„Start“ tippen – die App warnt dann vor Brücken in Fahrtrichtung oder auf Ihrer Route.</div>
+    </div>
+
+    <div class="controls">
+      <button id="btn-start" class="primary">Start</button>
+      <form id="dest-form" autocomplete="off">
+        <input id="dest-input" type="search" placeholder="Ziel (optional) …" aria-label="Ziel">
+        <button type="submit" class="secondary" aria-label="Ziel suchen">Route</button>
+      </form>
+    </div>
+    <ul id="dest-results" class="results" hidden></ul>
+
+    <div id="route-panel" hidden>
+      <div class="route-head">
+        <div>
+          <strong id="route-count">–</strong>
+          <span id="route-summary" class="muted"></span>
+          <div id="route-remaining" class="muted"></div>
+        </div>
+        <div class="route-actions">
+          <button id="btn-toggle-list" class="small">Ausblenden</button>
+          <button id="btn-demo" class="small" title="Fahrt entlang der Route simulieren">Demo</button>
+          <button id="btn-clear-route" class="small" title="Route löschen">✕</button>
+        </div>
+      </div>
+      <ul id="route-list" class="route-list"></ul>
+    </div>
+
+    <div id="info" class="info muted">Tipp: Lange auf die Karte tippen setzt ein Ziel.</div>
+  </section>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Einstellungen</h2>
+      <label>Ansage vor der Brücke
+        <select name="alertDistance">
+          <option value="200">200 m</option>
+          <option value="300">300 m</option>
+          <option value="500">500 m</option>
+          <option value="800">800 m</option>
+          <option value="1000">1 km</option>
+          <option value="1500">1,5 km</option>
+        </select>
+      </label>
+      <fieldset>
+        <legend>Mein Fahrzeug (0 = nicht prüfen)</legend>
+        <label>Höhe in m <input name="vehicleHeight" type="number" min="0" max="6" step="0.05" inputmode="decimal"></label>
+        <label>Gewicht in t <input name="vehicleWeight" type="number" min="0" max="60" step="0.5" inputmode="decimal"></label>
+        <p class="hint">Bei zu niedriger Durchfahrtshöhe oder zu geringer Tragfähigkeit gibt es eine frühere, deutliche Warnung (sofern in OpenStreetMap erfasst).</p>
+      </fieldset>
+      <fieldset>
+        <legend>Warnung</legend>
+        <label class="check"><input name="speech" type="checkbox"> Sprachansage</label>
+        <label class="check"><input name="sound" type="checkbox"> Signalton</label>
+        <label class="check"><input name="vibration" type="checkbox"> Vibration</label>
+        <button type="button" id="btn-test" class="small">Warnung testen</button>
+      </fieldset>
+      <fieldset>
+        <legend>Demo-Fahrt</legend>
+        <label>Geschwindigkeit km/h <input name="demoSpeed" type="number" min="10" max="200" step="10"></label>
+        <label>Zeitraffer
+          <select name="demoFactor"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option></select>
+        </label>
+      </fieldset>
+      <details>
+        <summary>Letzte Ansagen</summary>
+        <ul id="log" class="log"></ul>
+      </details>
+      <p class="hint">Daten: © OpenStreetMap-Mitwirkende (ODbL) · Routing: OSRM · Suche: Nominatim. Angaben ohne Gewähr – Verkehrszeichen haben Vorrang.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="secondary">Abbrechen</button>
+        <button value="save" class="primary">Speichern</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
