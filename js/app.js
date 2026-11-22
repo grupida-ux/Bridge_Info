@@ -2,7 +2,7 @@
 import { distance, bearing, destination, Polyline } from './geo.js';
 import { fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute, computeGroups } from './bridges.js';
 import { geocode, route as calcRoute } from './route.js';
-import { fetchArea, predictBridges } from './roads.js';
+import { TileStore, predictBridges } from './roads.js';
 import { unlockAudio, beep, speak, vibrate } from './alerts.js';
 
 /* ---------------- Einstellungen ---------------- */
@@ -39,6 +39,8 @@ const state = {
   // freie Fahrt
   bridges: new Map(),
   network: null,        // Straßennetz der Umgebung (Modus ohne Ziel)
+  tiles: new TileStore(),
+  predEnd: null,        // Ende des vorhergesagten Weges (für Vorausladen)
   matchWayId: null,     // zuletzt befahrene Straße
   loadingArea: false,
   lastLoadFail: 0,
@@ -190,7 +192,7 @@ function onPosition(p) {
     const look = Math.min(2500, Math.max(800, state.speed * 45, settings.alertDistance * 1.6));
     ensureAreaData(pos, state.heading, look);
     let pred = null;
-    if (state.heading != null && state.network?.contains(pos, 50)) {
+    if (state.heading != null && state.network && state.tiles.has(pos)) {
       const withUnder = settings.showUnder || settings.vehicleHeight > 0;
       pred = predictBridges(state.network, state.bridges, pos, state.heading, look, state.matchWayId, withUnder);
     }
@@ -198,6 +200,9 @@ function onPosition(p) {
       // Straße erkannt: ihrem Verlauf vorausfolgen
       mode = 'follow';
       state.matchWayId = pred.wayId;
+      // Endet die Vorhersage vor dem Horizont (Datenrand), dort Daten nachladen
+      state.predEnd = pred.length < look - 50
+        ? { point: pred.points[pred.points.length - 1], along: pred.length, minor: pred.endMinor } : null;
       upcoming = pred.items.filter(visible);
       drawPrediction(pred.points);
     } else {
@@ -268,38 +273,47 @@ function updateStatus(acc) {
 }
 
 /* ---------------- Straßen + Brücken der Umgebung laden (ohne Ziel) ---------------- */
-async function ensureAreaData(pos, heading, look) {
-  if (state.loadingArea) return;
-  const net = state.network;
-  const ahead = heading != null ? destination(pos, heading, look + 300) : pos;
-  if (net && net.contains(pos, 400) && net.contains(ahead)) return;
-  if (Date.now() - state.lastLoadFail < 20000) return;
-  state.loadingArea = true;
-  setInfo('Lade Straßen und Brücken in Fahrtrichtung …');
-  // Ausschnitt in Fahrtrichtung vorverlegt, damit seltener nachgeladen werden muss
-  const R = Math.min(5000, Math.max(2000, look * 2));
-  const c = heading != null ? destination(pos, heading, R * 0.5) : pos;
-  const bbox = {
-    n: destination(c, 0, R).lat, s: destination(c, 180, R).lat,
-    e: destination(c, 90, R).lon, w: destination(c, 270, R).lon,
-  };
-  try {
-    const { network, bridges } = await fetchArea(bbox);
-    state.network = network;
-    for (const [id, b] of bridges) state.bridges.set(id, b);
-    if (state.bridges.size > 6000) {
-      for (const [id, b] of state.bridges) if (distance(b.geom[0], pos) > 12000) state.bridges.delete(id);
-    }
-    computeGroups(state.bridges);
-    drawAreaBridges();
-    setInfo(`${network.ways.length} Straßenabschnitte und ${bridges.size} Brücken in Fahrtrichtung geladen`);
-  } catch (e) {
-    state.lastLoadFail = Date.now();
-    setInfo('Straßendaten konnten nicht geladen werden – neuer Versuch in Kürze');
-    console.warn(e);
-  } finally {
-    state.loadingArea = false;
-  }
+/**
+ * Lädt im Hintergrund nacheinander die Kacheln, die als Nächstes gebraucht
+ * werden. Vorhandene Daten bleiben nutzbar, solange geladen wird.
+ */
+function ensureAreaData(pos, heading, look) {
+  const tiles = state.tiles;
+  if (tiles.loading) return;
+  const todo = tiles.needed(pos, heading, state.speed || 0, look, state.predEnd, destination);
+  if (!todo.length) { setLoadIndicator(false); return; }
+  const w = todo[0];
+  const missingHere = !tiles.has(pos);
+  if (missingHere) setInfo('Lade Straßendaten für Ihre Position …');
+  setLoadIndicator(true);
+  tiles.load(w)
+    .then(() => {
+      tiles.prune(pos);
+      const { network, bridges } = tiles.build(state.pos || pos);
+      state.network = network;
+      for (const [id, b] of bridges) state.bridges.set(id, b);
+      if (state.bridges.size > 8000) {
+        for (const [id, b] of state.bridges) if (distance(b.geom[0], pos) > 25000) state.bridges.delete(id);
+      }
+      computeGroups(state.bridges);
+      drawAreaBridges();
+      if (missingHere) setInfo('Straßendaten geladen');
+    })
+    .catch((e) => {
+      console.warn(e);
+      if (!tiles.has(state.pos || pos)) setInfo('Straßendaten konnten nicht geladen werden (Funkloch oder Server überlastet) – neuer Versuch …');
+    })
+    .finally(() => {
+      // gleich die nächste benötigte Kachel holen
+      if (state.tracking && state.pos && state.mode !== 'route') {
+        const l = Math.min(2500, Math.max(800, (state.speed || 0) * 45, settings.alertDistance * 1.6));
+        setTimeout(() => ensureAreaData(state.pos, state.heading, l), 200);
+      } else setLoadIndicator(false);
+    });
+}
+
+function setLoadIndicator(on) {
+  $('status').classList.toggle('loading', on);
 }
 
 /* Vorhergesagter Weg (gestrichelt) */
@@ -407,7 +421,7 @@ function checkAlerts(upcoming, mode) {
     if (item.distance > threshold) continue;
     if (state.fired.has(item.key)) continue;
     // Bereits auf der Brücke (z. B. lange Hochstraße aus vielen Teilstücken): keine neue Ansage
-    if (item.onIt && mode === 'follow') { state.fired.add(item.key); continue; }
+    if (item.onIt) { state.fired.add(item.key); continue; }
     // Doppelte Meldungen (z. B. zweite Richtungsfahrbahn) vermeiden
     if (state.firedPoints.some((f) => f.type === item.type && distance(f.p, item.point) < 120)) {
       state.fired.add(item.key);

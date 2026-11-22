@@ -11,16 +11,119 @@ const RANK = {
 const rank = (hw) => RANK[(hw || '').replace('_link', '')] ?? 7;
 const CELL = 0.002;
 
-/** Straßen und Brücken in einer Bounding-Box laden */
-export async function fetchArea(bbox, signal) {
-  const bb = `${bbox.s},${bbox.w},${bbox.n},${bbox.e}`;
-  const q = `[out:json][timeout:60];(way["highway"~"^(${DRIVABLE})$"]["area"!="yes"](${bb});way["bridge"]["bridge"!="no"]["railway"](${bb});way["bridge"]["bridge"!="no"]["highway"](${bb}););out body geom qt;`;
-  const json = await overpass(q, signal, { attempts: 4, timeoutMs: 70000 });
-  const bridgeEls = json.elements.filter((e) => e.tags?.bridge && e.tags.bridge !== 'no');
-  return {
-    network: new RoadNetwork(json.elements, bbox),
-    bridges: parseBridges({ elements: bridgeEls }),
-  };
+/* ------------------------------------------------------------------
+ * Kachel-Speicher: Straßendaten in festen Kacheln (~2,8 × 2,7 km) laden.
+ * Kacheln bleiben erhalten (kein Neuladen bei Richtungswechsel oder auf
+ * bekannten Strecken) und werden vorausschauend in Fahrtrichtung geholt.
+ * Bei schneller Fahrt reichen die Hauptstraßen ("major") – das ist in
+ * Städten nur ein Bruchteil der Datenmenge.
+ * ------------------------------------------------------------------ */
+export const TILE_LAT = 0.025;
+export const TILE_LON = 0.04;
+const MAJOR = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|road|busway';
+const KEEP_TAGS = ['highway', 'railway', 'oneway', 'junction', 'ref', 'name', 'bridge', 'bridge:name', 'maxweight', 'maxheight', 'maxheight:physical', 'height', 'bridge:height', 'area'];
+
+export const tileOf = (p) => ({ r: Math.floor(p.lat / TILE_LAT), c: Math.floor(p.lon / TILE_LON) });
+const tileKey = (t) => t.r + ':' + t.c;
+const tileCenter = (t) => ({ lat: (t.r + 0.5) * TILE_LAT, lon: (t.c + 0.5) * TILE_LON });
+
+async function fetchTile(t, level, signal) {
+  const bb = `${t.r * TILE_LAT},${t.c * TILE_LON},${(t.r + 1) * TILE_LAT},${(t.c + 1) * TILE_LON}`;
+  const classes = level === 'all' ? DRIVABLE : MAJOR;
+  const q = `[out:json][timeout:50];(way["highway"~"^(${classes})$"]["area"!="yes"](${bb});way["bridge"]["bridge"!="no"]["railway"](${bb});way["bridge"]["bridge"!="no"]["highway"](${bb}););out body geom qt;`;
+  const json = await overpass(q, signal, { attempts: 4, timeoutMs: 60000 });
+  // nur benötigte Tags behalten (spart Speicher)
+  for (const el of json.elements) {
+    if (!el.tags) continue;
+    const t2 = {};
+    for (const k of KEEP_TAGS) if (el.tags[k] != null) t2[k] = el.tags[k];
+    el.tags = t2;
+  }
+  return json.elements;
+}
+
+export class TileStore {
+  constructor() {
+    this.tiles = new Map();   // key -> { t, level, els }
+    this.failed = new Map();  // key -> Zeitpunkt des Fehlers
+    this.loading = null;      // key der gerade geladenen Kachel
+  }
+
+  /** Sind für diesen Punkt Daten (mindestens Hauptstraßen) vorhanden? */
+  has(p, level = 'major') {
+    const e = this.tiles.get(tileKey(tileOf(p)));
+    return !!e && (e.level === 'all' || level === 'major');
+  }
+
+  /**
+   * Welche Kacheln werden gebraucht? Aktuelle Position, ein Fächer in
+   * Fahrtrichtung (Vorausschau + ca. 1 Minute Fahrt) und das Ende des
+   * vorhergesagten Weges. Nach Dringlichkeit sortiert.
+   */
+  needed(pos, heading, speed, look, predEnd, destinationFn) {
+    const slow = speed < 14; // < 50 km/h: auch Nebenstraßen laden
+    const want = new Map();
+    const add = (p, d, level) => {
+      const t = tileOf(p), k = tileKey(t);
+      const have = this.tiles.get(k);
+      if (have && (have.level === 'all' || level === 'major')) return;
+      const prev = want.get(k);
+      if (!prev || d < prev.d || (level === 'all' && prev.level !== 'all')) {
+        want.set(k, { t, k, d: Math.min(d, prev?.d ?? d), level: level === 'all' || prev?.level === 'all' ? 'all' : 'major' });
+      }
+    };
+    add(pos, 0, slow ? 'all' : 'major');
+    if (heading != null) {
+      const D = look + Math.max(1500, speed * 60);
+      for (let d = 400; d <= D; d += 400) {
+        const lvl = slow && d <= 1200 ? 'all' : 'major';
+        add(destinationFn(pos, heading, d), d, lvl);
+        if (d >= 800) {
+          add(destinationFn(pos, heading - 25, d), d + 200, lvl);
+          add(destinationFn(pos, heading + 25, d), d + 200, lvl);
+        }
+      }
+    }
+    if (predEnd) add(predEnd.point, predEnd.along, predEnd.minor ? 'all' : 'major');
+    const now = Date.now();
+    return [...want.values()]
+      .filter((w) => now - (this.failed.get(w.k) || 0) > 12000)
+      .sort((a, b) => a.d - b.d);
+  }
+
+  async load(w, signal) {
+    this.loading = w.k;
+    try {
+      const els = await fetchTile(w.t, w.level, signal);
+      this.tiles.set(w.k, { t: w.t, level: w.level, els });
+      this.failed.delete(w.k);
+      return els;
+    } catch (e) {
+      this.failed.set(w.k, Date.now());
+      throw e;
+    } finally {
+      this.loading = null;
+    }
+  }
+
+  /** Kacheln weit hinter dem Fahrzeug verwerfen (Speicher) */
+  prune(pos, maxDist = 25000) {
+    for (const [k, e] of this.tiles) if (distance(pos, tileCenter(e.t)) > maxDist) this.tiles.delete(k);
+  }
+
+  /** Straßennetz und Brücken aus allen Kacheln im Umkreis bauen */
+  build(pos, radius = 15000) {
+    const byId = new Map();
+    for (const e of this.tiles.values()) {
+      if (distance(pos, tileCenter(e.t)) > radius) continue;
+      for (const el of e.els) byId.set(el.id, el);
+    }
+    const els = [...byId.values()];
+    return {
+      network: new RoadNetwork(els),
+      bridges: parseBridges({ elements: els.filter((e) => e.tags?.bridge && e.tags.bridge !== 'no') }),
+    };
+  }
 }
 
 function onewayOf(t) {
@@ -34,8 +137,7 @@ function onewayOf(t) {
 }
 
 export class RoadNetwork {
-  constructor(elements, bbox) {
-    this.bbox = bbox;
+  constructor(elements) {
     this.ways = [];
     this.nodeWays = new Map();
     this.grid = new Map();
@@ -74,12 +176,6 @@ export class RoadNetwork {
         }
       }
     }
-  }
-
-  contains(p, margin = 0) {
-    const b = this.bbox;
-    const dLat = margin / 111320, dLon = margin / (111320 * Math.cos((p.lat * Math.PI) / 180));
-    return p.lat > b.s + dLat && p.lat < b.n - dLat && p.lon > b.w + dLon && p.lon < b.e - dLon;
   }
 
   /**
@@ -188,7 +284,7 @@ export class RoadNetwork {
       dir = nx.dir;
       idx = nx.k + dir;
     }
-    return { points, length: along, spans, wayId: this.ways[m.wi].id };
+    return { points, length: along, spans, wayId: this.ways[m.wi].id, endMinor: this.ways[wi].rank >= 7 };
   }
 }
 
