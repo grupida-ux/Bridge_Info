@@ -12,16 +12,21 @@ const rank = (hw) => RANK[(hw || '').replace('_link', '')] ?? 7;
 const CELL = 0.002;
 
 /* ------------------------------------------------------------------
- * Kachel-Speicher: Straßendaten in festen Kacheln (~2,8 × 2,7 km) laden.
- * Kacheln bleiben erhalten (kein Neuladen bei Richtungswechsel oder auf
- * bekannten Strecken) und werden vorausschauend in Fahrtrichtung geholt.
- * Bei schneller Fahrt reichen die Hauptstraßen ("major") – das ist in
- * Städten nur ein Bruchteil der Datenmenge.
+ * Kachel-Speicher für den Modus „Straße folgen“.
+ *  - In Deutschland kommen Hauptstraßen und Brücken aus den vorab
+ *    aufbereiteten Daten der eigenen Seite (staticData, ~11 × 10 km
+ *    je Kachel) – schnell und ohne Abfragelimits.
+ *  - Wohnstraßen (nur bei langsamer Fahrt nötig) und alles außerhalb
+ *    Deutschlands kommen weiterhin von Overpass (~2,8 × 2,7 km je Kachel).
+ * Kacheln bleiben erhalten und werden vorausschauend in Fahrtrichtung geholt.
  * ------------------------------------------------------------------ */
 export const TILE_LAT = 0.025;
 export const TILE_LON = 0.04;
 const MAJOR = 'motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|road|busway';
+const MINOR = 'residential|living_street';
 const KEEP_TAGS = ['highway', 'railway', 'oneway', 'junction', 'ref', 'name', 'bridge', 'bridge:name', 'maxweight', 'maxheight', 'maxheight:physical', 'height', 'bridge:height', 'area'];
+// Welche Overpass-Ebene deckt welche ab?
+const SATISFIES = { all: ['all', 'major', 'minor'], major: ['major'], minor: ['minor'] };
 
 export const tileOf = (p) => ({ r: Math.floor(p.lat / TILE_LAT), c: Math.floor(p.lon / TILE_LON) });
 const tileKey = (t) => t.r + ':' + t.c;
@@ -29,8 +34,9 @@ const tileCenter = (t) => ({ lat: (t.r + 0.5) * TILE_LAT, lon: (t.c + 0.5) * TIL
 
 async function fetchTile(t, level, signal) {
   const bb = `${t.r * TILE_LAT},${t.c * TILE_LON},${(t.r + 1) * TILE_LAT},${(t.c + 1) * TILE_LON}`;
-  const classes = level === 'all' ? DRIVABLE : MAJOR;
-  const q = `[out:json][timeout:50];(way["highway"~"^(${classes})$"]["area"!="yes"](${bb});way["bridge"]["bridge"!="no"]["railway"](${bb});way["bridge"]["bridge"!="no"]["highway"](${bb}););out body geom qt;`;
+  const classes = level === 'all' ? DRIVABLE : level === 'minor' ? MINOR : MAJOR;
+  const bridges = level === 'minor' ? '' : `way["bridge"]["bridge"!="no"]["railway"](${bb});way["bridge"]["bridge"!="no"]["highway"](${bb});`;
+  const q = `[out:json][timeout:50];(way["highway"~"^(${classes})$"]["area"!="yes"](${bb});${bridges});out body geom qt;`;
   const json = await overpass(q, signal, { attempts: 4, timeoutMs: 60000 });
   // nur benötigte Tags behalten (spart Speicher)
   for (const el of json.elements) {
@@ -43,16 +49,26 @@ async function fetchTile(t, level, signal) {
 }
 
 export class TileStore {
-  constructor() {
-    this.tiles = new Map();   // key -> { t, level, els }
+  /** @param staticData Instanz von StaticData (oder null) */
+  constructor(staticData = null) {
+    this.sd = staticData;
+    this.tiles = new Map();   // Overpass: key -> { t, level, els }
+    this.stat = new Map();    // vorab aufbereitet: key -> { key, els }
     this.failed = new Map();  // key -> Zeitpunkt des Fehlers
     this.loading = null;      // key der gerade geladenen Kachel
   }
 
-  /** Sind für diesen Punkt Daten (mindestens Hauptstraßen) vorhanden? */
-  has(p, level = 'major') {
+  _covered(p) { return !!this.sd?.available && this.sd.covers(p); }
+
+  _hasOverpass(p, level) {
     const e = this.tiles.get(tileKey(tileOf(p)));
-    return !!e && (e.level === 'all' || level === 'major');
+    return !!e && SATISFIES[e.level].includes(level);
+  }
+
+  /** Sind für diesen Punkt Hauptstraßen vorhanden? */
+  has(p) {
+    if (this._covered(p)) return this.stat.has(this.sd.tileKey(p));
+    return this._hasOverpass(p, 'major');
   }
 
   /**
@@ -61,30 +77,43 @@ export class TileStore {
    * vorhergesagten Weges. Nach Dringlichkeit sortiert.
    */
   needed(pos, heading, speed, look, predEnd, destinationFn) {
-    const slow = speed < 14; // < 50 km/h: auch Nebenstraßen laden
+    speed = Math.min(Math.max(speed || 0, 0), 70);
+    const slow = speed < 14; // < 50 km/h: auch Wohnstraßen laden
     const want = new Map();
-    const add = (p, d, level) => {
-      const t = tileOf(p), k = tileKey(t);
-      const have = this.tiles.get(k);
-      if (have && (have.level === 'all' || level === 'major')) return;
+    const put = (k, item) => {
       const prev = want.get(k);
-      if (!prev || d < prev.d || (level === 'all' && prev.level !== 'all')) {
-        want.set(k, { t, k, d: Math.min(d, prev?.d ?? d), level: level === 'all' || prev?.level === 'all' ? 'all' : 'major' });
+      if (!prev || item.d < prev.d) want.set(k, item);
+    };
+    const add = (p, d, withMinor) => {
+      if (distance(pos, p) > 10000) return; // Sicherheitsgrenze
+      if (this._covered(p)) {
+        const key = this.sd.tileKey(p);
+        if (!this.stat.has(key)) put('S' + key, { src: 'static', key, k: 'S' + key, d });
+        if (withMinor && !this._hasOverpass(p, 'minor')) {
+          const t = tileOf(p), k = tileKey(t);
+          put(k, { src: 'overpass', t, k, d: d + 300, level: 'minor' });
+        }
+      } else {
+        const level = withMinor ? 'all' : 'major';
+        if (this._hasOverpass(p, level)) return;
+        const t = tileOf(p), k = tileKey(t);
+        const prev = want.get(k);
+        want.set(k, { src: 'overpass', t, k, d: Math.min(d, prev?.d ?? d), level: prev?.level === 'all' ? 'all' : level });
       }
     };
-    add(pos, 0, slow ? 'all' : 'major');
+    add(pos, 0, slow);
     if (heading != null) {
       const D = look + Math.max(1500, speed * 60);
       for (let d = 400; d <= D; d += 400) {
-        const lvl = slow && d <= 1200 ? 'all' : 'major';
-        add(destinationFn(pos, heading, d), d, lvl);
+        const minor = slow && d <= 1200;
+        add(destinationFn(pos, heading, d), d, minor);
         if (d >= 800) {
-          add(destinationFn(pos, heading - 25, d), d + 200, lvl);
-          add(destinationFn(pos, heading + 25, d), d + 200, lvl);
+          add(destinationFn(pos, heading - 25, d), d + 200, minor);
+          add(destinationFn(pos, heading + 25, d), d + 200, minor);
         }
       }
     }
-    if (predEnd) add(predEnd.point, predEnd.along, predEnd.minor ? 'all' : 'major');
+    if (predEnd) add(predEnd.point, predEnd.along, predEnd.minor);
     const now = Date.now();
     return [...want.values()]
       .filter((w) => now - (this.failed.get(w.k) || 0) > 12000)
@@ -94,8 +123,18 @@ export class TileStore {
   async load(w, signal) {
     this.loading = w.k;
     try {
+      if (w.src === 'static') {
+        const els = await this.sd.roadTile(w.key);
+        this.stat.set(w.key, { key: w.key, els });
+        this.failed.delete(w.k);
+        return els;
+      }
       const els = await fetchTile(w.t, w.level, signal);
-      this.tiles.set(w.k, { t: w.t, level: w.level, els });
+      const prev = this.tiles.get(w.k);
+      // vorhandene Ebene ergänzen (z. B. Hauptstraßen + später Wohnstraßen)
+      const merged = prev ? prev.els.concat(els) : els;
+      const level = prev && prev.level !== w.level ? 'all' : w.level;
+      this.tiles.set(w.k, { t: w.t, level, els: merged });
       this.failed.delete(w.k);
       return els;
     } catch (e) {
@@ -108,7 +147,10 @@ export class TileStore {
 
   /** Kacheln weit hinter dem Fahrzeug verwerfen (Speicher) */
   prune(pos, maxDist = 25000) {
+    // maxDist muss deutlich größer sein als die Vorausladestrecke (max. ~7 km),
+    // sonst würden gerade geladene Kacheln sofort wieder verworfen
     for (const [k, e] of this.tiles) if (distance(pos, tileCenter(e.t)) > maxDist) this.tiles.delete(k);
+    for (const [k] of this.stat) if (distance(pos, this.sd.tileCenter(k)) > maxDist + 8000) this.stat.delete(k);
   }
 
   /** Straßennetz und Brücken aus allen Kacheln im Umkreis bauen */
@@ -116,6 +158,10 @@ export class TileStore {
     const byId = new Map();
     for (const e of this.tiles.values()) {
       if (distance(pos, tileCenter(e.t)) > radius) continue;
+      for (const el of e.els) byId.set(el.id, el);
+    }
+    for (const [k, e] of this.stat) {
+      if (distance(pos, this.sd.tileCenter(k)) > radius + 8000) continue;
       for (const el of e.els) byId.set(el.id, el);
     }
     const els = [...byId.values()];
@@ -144,12 +190,15 @@ export class RoadNetwork {
     const re = new RegExp(`^(${DRIVABLE})$`);
     for (const el of elements) {
       if (el.type !== 'way' || !el.tags || !re.test(el.tags.highway || '')) continue;
-      if (!el.geometry || !el.nodes || el.geometry.length < 2 || el.geometry.some((g) => !g)) continue;
+      if (!el.geometry || el.geometry.length < 2 || el.geometry.some((g) => !g)) continue;
       const t = el.tags;
       const w = {
         id: el.id,
         tags: t,
-        nodes: el.nodes,
+        // Knoten über die Koordinate verknüpfen – funktioniert für Overpass-
+        // und vorab aufbereitete Daten gleichermaßen (gemeinsame Knoten
+        // haben in OSM exakt dieselbe Koordinate)
+        nodes: el.geometry.map((g) => g.lat.toFixed(7) + ',' + g.lon.toFixed(7)),
         geom: el.geometry.map((g) => ({ lat: g.lat, lon: g.lon })),
         oneway: onewayOf(t),
         bridge: !!t.bridge && t.bridge !== 'no',

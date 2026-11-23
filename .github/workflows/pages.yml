@@ -1,0 +1,128 @@
+# Baut die Seite (App + aufbereitete OSM-Daten) und veröffentlicht sie über GitHub Pages.
+#
+# - Bei jedem Push auf main: App neu veröffentlichen, Daten aus dem Cache übernehmen.
+# - Monatlich (2. des Monats) und auf Knopfdruck: Daten neu aus OpenStreetMap erzeugen.
+# - Bei Pull Requests: nur bauen (zur Prüfung), nichts veröffentlichen.
+# Die Daten werden NICHT ins Repository eingecheckt, sondern zwischen den Läufen
+# im Actions-Cache aufbewahrt. Fehlt der Cache, werden sie automatisch neu erzeugt.
+name: GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 3 2 * *'
+  workflow_dispatch:
+    inputs:
+      rebuild_data:
+        description: 'OSM-Daten neu erzeugen'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+env:
+  OSM_URL: https://download.geofabrik.de/europe/germany-latest.osm.pbf
+  POLY_URL: https://download.geofabrik.de/europe/germany.poly
+  ROAD_CLASSES: motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,tertiary,tertiary_link,unclassified,road,busway
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vorhandene Daten aus dem Cache holen
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: osm-data
+          key: osm-data-v1-${{ github.run_id }}
+          restore-keys: osm-data-v1-
+
+      - name: Entscheiden, ob Daten neu erzeugt werden
+        id: decide
+        run: |
+          if [ ! -f osm-data/manifest.json ]; then echo "build=true" >> "$GITHUB_OUTPUT"; echo "Keine Daten im Cache"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.rebuild_data }}" = "true" ]; then echo "build=true" >> "$GITHUB_OUTPUT"
+          else echo "build=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Werkzeuge installieren
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          pip install --quiet osmium
+
+      - name: OSM-Daten herunterladen und filtern
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          curl -fsSL --retry 5 --retry-delay 30 -o germany.osm.pbf "$OSM_URL"
+          curl -fsSL --retry 5 --retry-delay 30 -o germany.poly "$POLY_URL"
+          ls -lh germany.osm.pbf
+          osmium tags-filter germany.osm.pbf "w/highway=$ROAD_CLASSES" w/bridge -o filtered.osm.pbf --overwrite
+          rm germany.osm.pbf
+          ls -lh filtered.osm.pbf
+
+      - name: Kacheln erzeugen
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          rm -rf osm-data
+          python3 tools/build_data.py filtered.osm.pbf osm-data --poly germany.poly --source "Geofabrik germany-latest"
+          du -sh osm-data osm-data/roads osm-data/bridges
+
+      - name: Daten im Cache ablegen
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: osm-data
+          key: osm-data-v1-${{ github.run_id }}
+
+      - name: Seite zusammenstellen
+        run: |
+          mkdir -p _site
+          cp -r index.html manifest.webmanifest sw.js icon.svg .nojekyll css js _site/
+          cp -r osm-data _site/data
+          du -sh _site
+
+      - name: Datenkacheln stichprobenartig prüfen
+        run: |
+          python3 - <<'PY'
+          import gzip, json, os
+          m = json.load(open('osm-data/manifest.json'))
+          print('Stand:', m.get('osm_date'), '| Kacheln Straßen:', len(m['roads']), '| Brücken:', len(m['bridges']))
+          assert len(m['roads']) > 100 and len(m['bridges']) > 100, 'zu wenige Kacheln'
+          for k in m['roads'][:: max(1, len(m['roads']) // 20)]:
+              d = json.loads(gzip.decompress(open(f'osm-data/roads/{k}.json.gz', 'rb').read()))
+              assert d['v'] == 1 and isinstance(d['ways'], list)
+          print('OK')
+          PY
+
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

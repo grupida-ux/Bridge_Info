@@ -3,6 +3,7 @@ import { distance, bearing, destination, Polyline } from './geo.js';
 import { fetchBridgesAlongChunk, routeChunks, bridgesAhead, matchBridgesToRoute, computeGroups } from './bridges.js';
 import { geocode, route as calcRoute } from './route.js';
 import { TileStore, predictBridges } from './roads.js';
+import { staticData } from './staticdata.js';
 import { unlockAudio, beep, speak, vibrate } from './alerts.js';
 
 /* ---------------- Einstellungen ---------------- */
@@ -39,7 +40,7 @@ const state = {
   // freie Fahrt
   bridges: new Map(),
   network: null,        // Straßennetz der Umgebung (Modus ohne Ziel)
-  tiles: new TileStore(),
+  tiles: new TileStore(staticData),
   predEnd: null,        // Ende des vorhergesagten Weges (für Vorausladen)
   matchWayId: null,     // zuletzt befahrene Straße
   loadingArea: false,
@@ -145,7 +146,11 @@ function onPosition(p) {
   const pos = { lat: p.lat, lon: p.lon };
   const prev = state.pos;
   state.pos = pos;
-  state.speed = p.speed != null && !Number.isNaN(p.speed) ? p.speed : prev && p.dt ? distance(prev, pos) / p.dt : state.speed;
+  // Geschwindigkeit: vom GPS, sonst aus der Positionsänderung. Ausreißer
+  // (GPS-Sprünge, sehr kurze Zeitabstände) auf plausible Werte begrenzen.
+  let v = p.speed != null && !Number.isNaN(p.speed) ? p.speed
+    : prev && p.dt >= 0.5 ? distance(prev, pos) / p.dt : state.speed;
+  state.speed = Math.max(0, Math.min(v || 0, 70)); // max. ~250 km/h
 
   // Fahrtrichtung: GPS-Kurs bei Fahrt, sonst aus Positionsverlauf
   if (p.heading != null && !Number.isNaN(p.heading) && state.speed > 1.5) {
@@ -622,7 +627,11 @@ async function loadRouteBridges(poly, ctrl) {
     for (const c of todo) {
       try {
         report(' …');
-        const res = await fetchBridgesAlongChunk(c.pts, 30, ctrl.signal, { attempts: 4 });
+        await staticData.init();
+        // In Deutschland aus den eigenen, vorab aufbereiteten Daten; sonst Overpass
+        const res = staticData.available && c.pts.every((p) => staticData.covers(p))
+          ? await staticData.bridgesNear(c.pts, 40)
+          : await fetchBridgesAlongChunk(c.pts, 30, ctrl.signal, { attempts: 4 });
         for (const [id, b] of res) bridgeCache.set(id, b);
         c.done = true;
         loadedLines.push(new Polyline(c.pts));
@@ -785,6 +794,13 @@ $('btn-test').addEventListener('click', () => {
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
+
+// Vorab aufbereitete Daten (falls vorhanden) früh laden
+staticData.init().then((m) => {
+  if (!m) return;
+  const d = new Date(m.osm_date || m.built);
+  $('data-info').textContent = `Kartendaten Deutschland: Stand ${d.toLocaleDateString('de-DE')} (monatlich aktualisiert); Wohnstraßen und Ausland live`;
+});
 
 // Für Tests/Debugging
 window.BridgeInfo = { state, settings, onPosition, planRoute, setDestination, startDemo, stop };
