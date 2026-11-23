@@ -9,6 +9,7 @@ Web-App fürs Smartphone, die per GPS Standort und Fahrtrichtung erkennt und **i
 - **Überfahrt oder Unterführung:** Verläuft die Brücke in Ihrer Fahrtrichtung, fahren Sie darüber. Kreuzt sie Ihre Strecke, fahren Sie darunter durch. Parallel verlaufende Fuß-/Radwegbrücken werden ignoriert, die beiden Richtungsfahrbahnen einer Autobahnbrücke werden zu einer Meldung zusammengefasst.
 - **Fahrzeughöhe/-gewicht:** In den Einstellungen eintragen. Ist eine Unterführung zu niedrig (`maxheight`) oder eine Brücke nicht tragfähig genug (`maxweight`), kommt eine frühere, rote Warnung (ab 1,5 km) und die Brücke ist auf der Karte rot markiert.
 - **Demo-Modus:** Simuliert eine Fahrt entlang der geplanten Route (Geschwindigkeit und Zeitraffer einstellbar). **„Demo ohne Ziel“** fährt dieselbe Strecke ab, ohne dass die App die Route kennt. So lässt sich der Modus „Straße folgen“ testen.
+- **Listenansicht:** Über ☰ oben rechts wechselt die App in eine Ansicht ohne Karte. Sie zeigt die nächsten 5 Brücken in großer Schrift, die nächste hervorgehoben. Mit 🗺 geht es zurück zur Karte, die Wahl bleibt gespeichert.
 - Bildschirm bleibt während der Fahrt an (Wake Lock), App ist als PWA installierbar.
 
 ## Benutzung

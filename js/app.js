@@ -233,6 +233,7 @@ function onPosition(p) {
   } else drawPrediction(null);
 
   state.mode = mode;
+  state.lastUpcoming = upcoming;
   renderNext(upcoming, mode);
   renderRouteList(upcoming, mode);
   checkAlerts(upcoming, mode);
@@ -275,6 +276,7 @@ function updateStatus(acc) {
   parts.push(`${kmh} km/h`);
   if (state.heading != null) parts.push(`${Math.round(state.heading)}°`);
   $('status').textContent = parts.join(' · ');
+  $('lv-status').textContent = parts.join(' · ');
 }
 
 /* ---------------- Straßen + Brücken der Umgebung laden (ohne Ziel) ---------------- */
@@ -354,6 +356,8 @@ function renderNext(upcoming, mode) {
   $('mode').textContent = mode === 'route' ? 'Route'
     : state.route && !state.demoNoRoute ? 'Abseits der Route'
     : mode === 'follow' ? 'Straße folgen' : 'Geradeaus';
+  $('lv-mode').textContent = $('mode').textContent;
+  renderListView(upcoming, mode);
   if (!state.tracking) return;
   if (!item) {
     box.className = 'next empty';
@@ -376,6 +380,59 @@ function renderNext(upcoming, mode) {
       ${warn ? `<div class="next-warn">⚠ ${esc(warn)}</div>` : ''}
     </div>`;
   highlight(item);
+}
+
+/* ---------------- Listenansicht ---------------- */
+const LIST_MAX = 5;
+
+/** Leere Liste: gleicher Hinweis wie im Kartenpanel */
+function emptyMessage(mode) {
+  if (!state.tracking) return ['Pausiert', '„Start“ tippen, um die Überwachung zu beginnen'];
+  if (state.heading == null) return ['Warte auf Fahrtrichtung …', 'Losfahren oder Route planen'];
+  if (routeDataMissing(mode)) return ['Brückendaten werden noch geladen', 'Bitte auf Schilder achten'];
+  return ['Keine Brücke voraus', mode === 'route' ? 'auf der restlichen Route' : mode === 'follow' ? 'im weiteren Straßenverlauf' : 'in Fahrtrichtung'];
+}
+
+function renderListView(upcoming, mode) {
+  if (!document.body.classList.contains('view-list')) return;
+  let items = upcoming;
+  // Vor dem Start: die ersten Brücken der geplanten Route zeigen
+  if (!state.tracking && state.routeBridges.length) items = state.routeBridges.map((b) => ({ ...b, distance: b.along, fromStart: true }));
+  items = items.slice(0, LIST_MAX);
+  const ol = $('lv-items');
+  if (!items.length) {
+    const [t, sub] = emptyMessage(mode);
+    ol.innerHTML = `<li class="lv-empty"><div class="lv-name">${esc(t)}</div><div class="lv-sub">${esc(sub)}</div></li>`;
+    return;
+  }
+  ol.innerHTML = items.map((i) => {
+    const warn = conflict(i);
+    const cls = warn ? 'danger' : !i.fromStart && i.distance < settings.alertDistance ? 'near' : '';
+    const dist = i.onIt ? 'Jetzt' : fmtDist(i.distance);
+    // Überfahrten sind der Normalfall – nur Unterführungen extra kennzeichnen
+    const sub = [i.type === 'under' ? TYPE_LABEL.under : '', details(i)].filter(Boolean).join(' · ');
+    const flash = state.flash && state.flash.key === i.key && Date.now() < state.flash.until ? ' flash' : '';
+    return `<li class="${cls}${flash}">
+      <div class="lv-dist">${dist}</div>
+      <div class="lv-body">
+        <div class="lv-name">${esc(i.name)}</div>
+        <div class="lv-sub">${esc(sub)}${i.fromStart ? ' · ab Start' : ''}</div>
+        ${warn ? `<div class="lv-warn">⚠ ${esc(warn)}</div>` : ''}
+      </div></li>`;
+  }).join('');
+}
+
+function setView(view) {
+  const list = view === 'list';
+  document.body.classList.toggle('view-list', list);
+  save('bridgeinfo.view', view);
+  if (list) {
+    $('lv-mode').textContent = $('mode').textContent;
+    $('lv-status').textContent = $('status').textContent;
+    renderListView(state.lastUpcoming || [], state.mode);
+  } else {
+    setTimeout(() => map.invalidateSize(), 50);
+  }
 }
 
 /** Fehlen für die nächsten Kilometer der Route noch Daten? */
@@ -451,6 +508,9 @@ function fireAlert(item, warn) {
     if (item.height != null) text += `, ${nf1.format(item.height)} Meter hoch`;
   }
 
+  // In der Listenansicht blinkt statt des Banners der Eintrag selbst
+  state.flash = { key: item.key, until: Date.now() + (warn ? 15000 : 8000) };
+  if (document.body.classList.contains('view-list')) renderListView(state.lastUpcoming || [], state.mode);
   const banner = $('alert');
   banner.className = `alert show ${warn ? 'danger' : ''}`;
   banner.innerHTML = `<div class="alert-icon">${item.type === 'under' ? iconUnder : iconOver}</div>
@@ -502,13 +562,16 @@ function stop() {
   releaseWakeLock();
   $('next').className = 'next empty';
   $('next').innerHTML = '<div class="next-title">Pausiert</div><div class="next-sub">„Start“ tippen, um die Überwachung zu beginnen</div>';
+  state.lastUpcoming = [];
+  renderListView([], state.mode);
 }
 
 function updateStartButton() {
-  const b = $('btn-start');
   const on = state.tracking;
-  b.textContent = on ? (state.demoTimer ? 'Demo stoppen' : 'Stopp') : 'Start';
-  b.classList.toggle('on', on);
+  for (const b of [$('btn-start'), $('lv-btn-start')]) {
+    b.textContent = on ? (state.demoTimer ? 'Demo stoppen' : 'Stopp') : 'Start';
+    b.classList.toggle('on', on);
+  }
 }
 
 async function requestWakeLock() {
@@ -601,6 +664,7 @@ async function loadRouteBridges(poly, ctrl) {
     state.routeBridges = state.routeBridgesAll.filter(visible);
     drawRouteBridges();
     renderRouteList([], 'none');
+    if (!state.tracking) renderListView([], state.mode);
     if (state.pos && state.tracking) onPosition({ ...state.pos, accuracy: null, speed: state.speed, heading: state.heading });
   };
   const report = (extra = '') => {
@@ -727,6 +791,11 @@ function log(t) {
 
 /* ---------------- UI-Verdrahtung ---------------- */
 $('btn-start').addEventListener('click', () => (state.tracking ? stop() : start()));
+$('lv-btn-start').addEventListener('click', () => (state.tracking ? stop() : start()));
+$('btn-view').addEventListener('click', () => setView('list'));
+$('lv-btn-map').addEventListener('click', () => setView('map'));
+$('lv-btn-settings').addEventListener('click', () => $('btn-settings').click());
+setView(load('bridgeinfo.view', 'map'));
 $('btn-center').addEventListener('click', () => setFollow(true));
 $('btn-demo').addEventListener('click', () => startDemo(false));
 $('btn-demo-free').addEventListener('click', () => startDemo(true));
