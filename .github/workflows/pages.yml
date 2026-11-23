@@ -2,12 +2,15 @@
 #
 # - Bei jedem Push auf main: App neu veröffentlichen, Daten aus dem Cache übernehmen.
 # - Monatlich (2. des Monats) und auf Knopfdruck: Daten neu aus OpenStreetMap erzeugen.
+# - Bei Pull Requests: nur bauen (zur Prüfung), nichts veröffentlichen.
 # Die Daten werden NICHT ins Repository eingecheckt, sondern zwischen den Läufen
 # im Actions-Cache aufbewahrt. Fehlt der Cache, werden sie automatisch neu erzeugt.
 name: GitHub Pages
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   schedule:
     - cron: '17 3 2 * *'
@@ -24,7 +27,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
   cancel-in-progress: false
 
 env:
@@ -93,12 +96,28 @@ jobs:
           cp -r osm-data _site/data
           du -sh _site
 
+      - name: Datenkacheln stichprobenartig prüfen
+        run: |
+          python3 - <<'PY'
+          import gzip, json, os
+          m = json.load(open('osm-data/manifest.json'))
+          print('Stand:', m.get('osm_date'), '| Kacheln Straßen:', len(m['roads']), '| Brücken:', len(m['bridges']))
+          assert len(m['roads']) > 100 and len(m['bridges']) > 100, 'zu wenige Kacheln'
+          for k in m['roads'][:: max(1, len(m['roads']) // 20)]:
+              d = json.loads(gzip.decompress(open(f'osm-data/roads/{k}.json.gz', 'rb').read()))
+              assert d['v'] == 1 and isinstance(d['ways'], list)
+          print('OK')
+          PY
+
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: _site
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
