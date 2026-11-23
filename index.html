@@ -18,8 +18,22 @@
 
   <div id="topbar">
     <div class="chip"><span id="mode">Freie Fahrt</span> · <span id="status">GPS aus</span></div>
+    <button id="btn-view" class="icon-btn" title="Zur Listenansicht" aria-label="Zur Listenansicht">☰</button>
     <button id="btn-settings" class="icon-btn" title="Einstellungen" aria-label="Einstellungen">⚙</button>
   </div>
+
+  <!-- Listenansicht: keine Karte, nur die nächsten 5 Brücken in großer Schrift -->
+  <section id="listview" aria-label="Nächste Brücken">
+    <header class="lv-head">
+      <div class="lv-status"><strong id="lv-mode">Freie Fahrt</strong><span id="lv-status">GPS aus</span></div>
+      <button id="lv-btn-map" class="icon-btn" title="Zur Kartenansicht" aria-label="Zur Kartenansicht">🗺</button>
+      <button id="lv-btn-settings" class="icon-btn" title="Einstellungen" aria-label="Einstellungen">⚙</button>
+    </header>
+    <ol id="lv-items" class="lv-items"></ol>
+    <footer class="lv-foot">
+      <button id="lv-btn-start" class="primary lv-start">Start</button>
+    </footer>
+  </section>
 
   <div id="alert" class="alert" role="alert" aria-live="assertive"></div>
   <div id="toast" class="toast" role="status"></div>
