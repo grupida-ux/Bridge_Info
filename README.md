@@ -20,9 +20,16 @@ Web-App fürs Smartphone, die per GPS Standort und Fahrtrichtung erkennt und **i
 
 Tipp fürs Handy: Im Browser-Menü „Zum Startbildschirm hinzufügen“ wählen, dann startet die App im Vollbild.
 
-## Veröffentlichen (GitHub Pages)
+## Veröffentlichen (GitHub Pages) und Kartendaten
 
-Die App besteht nur aus statischen Dateien. GitHub Pages ist auf „Deploy from a branch“ mit `main` und `/ (root)` eingestellt. Jeder Push auf `main` wird automatisch veröffentlicht unter `https://grupida-ux.github.io/Bridge_Info/`.
+Der Workflow `.github/workflows/pages.yml` veröffentlicht die App und die aufbereiteten Kartendaten. Unter *Settings → Pages* muss als Quelle **„GitHub Actions“** eingestellt sein.
+
+- **Bei jedem Push auf `main`** wird die App neu veröffentlicht. Die Kartendaten kommen aus dem Actions-Cache und werden nicht neu erzeugt.
+- **Monatlich (am 2.)** und auf Knopfdruck (*Actions → GitHub Pages → Run workflow*) werden die Daten neu erzeugt. Der Job lädt `germany-latest.osm.pbf` von Geofabrik, filtert mit `osmium` Hauptstraßen und Brücken heraus und schneidet sie mit `tools/build_data.py` in gzip-gepackte Kacheln (ca. 11 × 10 km). Das dauert etwa 30–60 Minuten.
+- Die App holt **Hauptstraßen und Brücken in Deutschland** aus diesen Kacheln (`data/`). Overpass braucht sie nur noch für Wohnstraßen bei langsamer Fahrt und für Gebiete außerhalb Deutschlands. Geladene Kacheln bleiben auf dem Gerät gespeichert, bis neue Daten erscheinen.
+- Ohne `data/` (z. B. lokal) fragt die App wie früher alles bei Overpass ab.
+
+Die Daten landen nicht im Repository, sondern nur in der veröffentlichten Seite.
 
 Lokal testen: `python3 -m http.server 8000` und `http://localhost:8000` öffnen (localhost zählt als sicher, GPS funktioniert also).
 
@@ -32,6 +39,8 @@ Lokal testen: `python3 -m http.server 8000` und `http://localhost:8000` öffnen 
 |---|---|
 | `index.html`, `css/style.css` | Oberfläche (Karte, Panel, Einstellungen) |
 | `js/app.js` | Ortung, Fahrtrichtung, Modi, Warnlogik, Demo |
+| `js/staticdata.js` | Liest die vorab aufbereiteten Kartenkacheln |
+| `tools/build_data.py` | Erzeugt die Kartenkacheln aus OSM-Daten (läuft in GitHub Actions) |
 | `js/roads.js` | Straßennetz laden, Map-Matching, dem Straßenverlauf vorausfolgen |
 | `js/bridges.js` | Overpass-Abfragen, Brücken-Erkennung voraus, Abgleich mit der Route |
 | `js/geo.js` | Geometrie: Distanzen, Kurse, Map-Matching mit Gitter-Index |
@@ -44,6 +53,6 @@ Lokal testen: `python3 -m http.server 8000` und `http://localhost:8000` öffnen 
 - **Datenqualität:** Alle Brückendaten stammen aus OpenStreetMap. Fehlt eine Brücke dort oder ist keine Durchfahrtshöhe eingetragen, kann die App nicht warnen. **Verkehrszeichen haben immer Vorrang.**
 - **Ohne Ziel** nimmt die App an, dass Sie der Straße folgen. Biegen Sie ab, kann die Ansage einer Brücke kommen, die Sie dann nicht überfahren. Eine Brücke direkt nach einer Abzweigung wird erst nach dem Abbiegen erkannt.
 - **Hintergrund:** Browser liefern GPS nur, solange die Seite sichtbar ist. Lassen Sie die App während der Fahrt im Vordergrund; die App hält den Bildschirm wach.
-- Es werden die öffentlichen, kostenlosen Dienste von OpenStreetMap (Kacheln, Overpass, Nominatim) und OSRM genutzt. Für privaten Gebrauch passt das. Wer die App vielen Nutzern anbietet, sollte eigene oder kommerzielle Instanzen verwenden.
+- Routing (OSRM), Adresssuche (Nominatim), die Hintergrundkarte und Overpass (Wohnstraßen, Ausland) sind öffentliche, kostenlose Dienste. Für privaten Gebrauch passt das. Wer die App vielen Nutzern anbietet, sollte eigene oder kommerzielle Instanzen verwenden.
 
 Daten © OpenStreetMap-Mitwirkende, ODbL.
