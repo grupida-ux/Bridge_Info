@@ -98,6 +98,20 @@
       </fieldset>
       <fieldset>
         <legend>Warnung</legend>
+        <label>Brücken melden ab Länge
+          <select name="minLength">
+            <option value="0">alle</option>
+            <option value="10">10 m</option>
+            <option value="20">20 m</option>
+            <option value="50">50 m</option>
+            <option value="100">100 m</option>
+            <option value="200">200 m</option>
+            <option value="300">300 m</option>
+            <option value="500">500 m</option>
+            <option value="1000">1 km</option>
+          </select>
+        </label>
+        <p class="hint">Kürzere Brücken werden weder angesagt noch in der Liste gezeigt. Zu niedrige oder nicht tragfähige Brücken für Ihr Fahrzeug werden immer gemeldet.</p>
         <label class="check"><input name="speech" type="checkbox"> Sprachansage</label>
         <label class="check"><input name="sound" type="checkbox"> Signalton</label>
         <label class="check"><input name="vibration" type="checkbox"> Vibration</label>

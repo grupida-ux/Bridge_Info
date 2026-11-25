@@ -1,5 +1,5 @@
 // Brückendaten aus OpenStreetMap (Overpass API) laden und auswerten
-import { distance, bearing, axisDiff, densify, simplify, makeProjector } from './geo.js';
+import { distance, bearing, angleDiff, axisDiff, densify, simplify, makeProjector } from './geo.js';
 
 export const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
@@ -279,9 +279,10 @@ export function matchBridgesToRoute(bridges, route, maxDist = 12) {
   const merged = [];
   for (const h of hits) {
     // letzte Gruppe gleichen Typs suchen (Überfahrt/Unterführung können sich abwechseln)
+    // (kurze Unterführungen mitten auf einer langen Brücke dürfen die Suche nicht abbrechen)
     let prev = null;
-    for (let i = merged.length - 1; i >= 0 && merged[i].alongEnd >= h.along - 200; i--) {
-      if (merged[i].type === h.type) { prev = merged[i]; break; }
+    for (let i = merged.length - 1; i >= 0 && merged[i].along >= h.along - 5000; i--) {
+      if (merged[i].type === h.type && h.along <= merged[i].alongEnd + 40) { prev = merged[i]; break; }
     }
     if (prev && h.along <= prev.alongEnd + 40) {
       prev.bridges.push(h.bridge);
@@ -329,12 +330,26 @@ export function computeGroups(bridges) {
     }
   }
   for (const arr of ends.values()) {
+    // Nur gerade Fortsetzungen verbinden: Die Richtungen vom gemeinsamen Punkt
+    // weg müssen (fast) entgegengesetzt sein. Treffen sich mehr als zwei Wege
+    // (z. B. Rampe zweigt ab), werden nur die geradesten Paare verbunden –
+    // jedes Wegende höchstens einmal.
+    const pairs = [];
     for (let i = 0; i < arr.length; i++) for (let j = i + 1; j < arr.length; j++) {
       const A = arr[i], B = arr[j];
-      if (A.b.kind !== B.b.kind) continue;
-      // gerade Fortsetzung: Richtungen vom gemeinsamen Punkt weg sind entgegengesetzt
-      if (axisDiff(A.dir, B.dir) > 30) continue;
-      parent.set(find(A.b.id), find(B.b.id));
+      if (A.b.kind !== B.b.kind || A.b === B.b) continue;
+      const ta = A.b.tags, tb = B.b.tags;
+      if (ta.ref && tb.ref && ta.ref !== tb.ref) continue;
+      if (!ta.ref && !tb.ref && ta.name && tb.name && ta.name !== tb.name) continue;
+      const opp = Math.abs(angleDiff(A.dir, B.dir));
+      if (opp >= 150) pairs.push([opp, i, j]);
+    }
+    pairs.sort((x, y) => y[0] - x[0]);
+    const used = new Set();
+    for (const [, i, j] of pairs) {
+      if (used.has(i) || used.has(j)) continue;
+      used.add(i); used.add(j);
+      parent.set(find(arr[i].b.id), find(arr[j].b.id));
     }
   }
   const sums = new Map();

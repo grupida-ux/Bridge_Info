@@ -15,6 +15,7 @@ const DEFAULTS = {
   sound: true,
   vibration: true,
   showUnder: false,     // Unterführungen (unter Brücken durch) anzeigen
+  minLength: 0,         // m – kürzere Brücken nicht melden (0 = alle)
   demoSpeed: 80,        // km/h
   demoFactor: 2,        // Zeitraffer
 };
@@ -127,7 +128,15 @@ function conflict(item) {
  * eigene Fahrzeug zu niedrig sind (Sicherheitswarnung).
  */
 function visible(item) {
-  return item.type !== 'under' || settings.showUnder || !!conflict(item);
+  if (conflict(item)) return true; // Sicherheitswarnungen immer
+  if (item.type === 'under') return settings.showUnder;
+  // Mindestlänge (Überfahrten). Steht man schon auf der Brücke, ist item.length
+  // nur der Rest – daher auch die Gesamtlänge des Brückenzugs berücksichtigen.
+  if (settings.minLength > 0) {
+    const len = Math.max(item.length ?? 0, ...(item.bridges || [item.bridge]).map((b) => b?.groupLength ?? 0));
+    if (len < settings.minLength) return false;
+  }
+  return true;
 }
 
 const fmtLen = (m) => (m >= 1000 ? `${nf1.format(m / 1000)} km` : `${Math.max(1, Math.round(m))} m`);
@@ -336,6 +345,7 @@ function drawAreaBridges() {
   areaLayer.clearLayers();
   for (const b of state.bridges.values()) {
     if (b.kind !== 'road' && !settings.showUnder) continue;
+    if (settings.minLength > 0 && (b.groupLength ?? b.length) < settings.minLength) continue;
     L.polyline(b.geom.map((p) => [p.lat, p.lon]), { className: `bridge-line kind-${b.kind}`, weight: 5 })
       .bindPopup(popupHtml({ name: b.name, maxheight: b.maxheight, maxweight: b.maxweight, length: b.groupLength ?? b.length, height: b.height }, b))
       .addTo(areaLayer);
