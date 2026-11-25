@@ -1,5 +1,5 @@
 // Service Worker: App-Dateien offline verfügbar; Datenkacheln dauerhaft zwischengespeichert
-const CACHE = 'bridgeinfo-v5';
+const CACHE = 'bridgeinfo-v6';
 const DATA_CACHE = 'bridgeinfo-data'; // Datenkacheln (versioniert über ?v=)
 const SHELL = ['./', 'index.html', 'css/style.css', 'js/app.js', 'js/geo.js', 'js/bridges.js', 'js/route.js', 'js/alerts.js', 'js/roads.js', 'js/staticdata.js', 'icon.svg', 'manifest.webmanifest'];
 
